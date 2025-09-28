@@ -3,7 +3,7 @@ import time
 from threading import Lock
 from collections import deque
 
-import opuslib
+import opuslib_next as opuslib
 
 from .constants import *
 

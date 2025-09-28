@@ -4,7 +4,7 @@ from time import time
 import struct
 import threading
 import socket
-import opuslib
+import opuslib_next as opuslib
 
 from .constants import *
 from .errors import CodecNotSupportedError
