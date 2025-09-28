@@ -22,16 +22,14 @@ from . import mumble_pb2
 def _wrap_socket(sock, keyfile=None, certfile=None, verify_mode=ssl.CERT_NONE, server_hostname=None):
     try:
         ssl_context = ssl.create_default_context()
+        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
         if certfile:
             ssl_context.load_cert_chain(certfile, keyfile)
         ssl_context.check_hostname = (verify_mode != ssl.CERT_NONE) and (server_hostname is not None)
         ssl_context.verify_mode = verify_mode
         return ssl_context.wrap_socket(sock, server_hostname=server_hostname)
     except AttributeError:
-        try:
-            return ssl.wrap_socket(sock, keyfile, certfile, cert_reqs=verify_mode, ssl_version=ssl.PROTOCOL_TLS)
-        except AttributeError:
-            return ssl.wrap_socket(sock, keyfile, certfile, cert_reqs=verify_mode, ssl_version=ssl.PROTOCOL_TLSv1)
+        return ssl.wrap_socket(sock, keyfile, certfile, cert_reqs=verify_mode, ssl_version=ssl.PROTOCOL_TLSv1_2)
 
 
 class Mumble(threading.Thread):
