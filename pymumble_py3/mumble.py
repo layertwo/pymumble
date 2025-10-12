@@ -174,20 +174,37 @@ class Mumble(threading.Thread):
             self.connected = PYMUMBLE_CONN_STATE_FAILED
             return self.connected
 
-        # FIXME: Default verify_mode and server_hostname are not safe, as no
-        #        certificate checks are performed.
-        self.control_socket = _wrap_socket(std_sock, self.keyfile, self.certfile)
+        try:
+            # --- START: 修复代码 ---
+            # 优先使用现代的 SSLContext 方法
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE # Mumble通常不要求验证服务器证书
+            
+            if self.certfile and self.keyfile:
+                context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+
+            self.control_socket = context.wrap_socket(std_sock, 
+                                                      server_hostname=self.host)
+            # --- END: 修复代码 ---
+            
+        except AttributeError:
+            # Fallback for older Python versions that might lack PROTOCOL_TLS_CLIENT
+            # or if the user specifically uses a very old environment.
+            # 尽管这是旧代码，但为了兼容性保留，不过在 Python 3.12 中通常还是会失败，
+            # 真正的解决方案是上面的 SSLContext。
+            try:
+                self.control_socket = ssl.wrap_socket(std_sock, certfile=self.certfile, keyfile=self.keyfile, ssl_version=ssl.PROTOCOL_TLS)
+            except AttributeError:
+                self.control_socket = ssl.wrap_socket(std_sock, certfile=self.certfile, keyfile=self.keyfile, ssl_version=ssl.PROTOCOL_TLSv1)
+
         try:
             self.control_socket.connect((self.host, self.port))
             self.control_socket.setblocking(False)
 
             # Perform the Mumble authentication
             version = mumble_pb2.Version()
-            if PYMUMBLE_PROTOCOL_VERSION[2] > 255:
-                version.version_v1 = (PYMUMBLE_PROTOCOL_VERSION[0] << 16) + (PYMUMBLE_PROTOCOL_VERSION[1] << 8) + 255
-            else:
-                version.version_v1 = (PYMUMBLE_PROTOCOL_VERSION[0] << 16) + (PYMUMBLE_PROTOCOL_VERSION[1] << 8) + (PYMUMBLE_PROTOCOL_VERSION[2])
-            version.version_v2 = (PYMUMBLE_PROTOCOL_VERSION[0] << 48) + (PYMUMBLE_PROTOCOL_VERSION[1] << 32) + (PYMUMBLE_PROTOCOL_VERSION[2] << 16)
+            version.version = (PYMUMBLE_PROTOCOL_VERSION[0] << 16) + (PYMUMBLE_PROTOCOL_VERSION[1] << 8) + PYMUMBLE_PROTOCOL_VERSION[2]
             version.release = self.application
             version.os = PYMUMBLE_OS_STRING
             version.os_version = PYMUMBLE_OS_VERSION_STRING
@@ -199,7 +216,6 @@ class Mumble(threading.Thread):
             authenticate.password = self.password
             authenticate.tokens.extend(self.tokens)
             authenticate.opus = True
-            authenticate.client_type = self.client_type
             self.Log.debug("sending: authenticate: %s", authenticate)
             self.send_message(PYMUMBLE_MSG_TYPES_AUTHENTICATE, authenticate)
         except socket.error:
@@ -208,7 +224,6 @@ class Mumble(threading.Thread):
 
         self.connected = PYMUMBLE_CONN_STATE_AUTHENTICATING
         return self.connected
-
     def loop(self):
         """
         Main loop
