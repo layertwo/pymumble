@@ -15,21 +15,9 @@ from . import blobs
 from . import commands
 from . import callbacks
 from . import tools
+from . import soundoutput
 
 from . import mumble_pb2
-
-
-def _wrap_socket(sock, keyfile=None, certfile=None, verify_mode=ssl.CERT_NONE, server_hostname=None):
-    try:
-        ssl_context = ssl.create_default_context()
-        ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        if certfile:
-            ssl_context.load_cert_chain(certfile, keyfile)
-        ssl_context.check_hostname = (verify_mode != ssl.CERT_NONE) and (server_hostname is not None)
-        ssl_context.verify_mode = verify_mode
-        return ssl_context.wrap_socket(sock, server_hostname=server_hostname)
-    except AttributeError:
-        return ssl.wrap_socket(sock, keyfile, certfile, cert_reqs=verify_mode, ssl_version=ssl.PROTOCOL_TLSv1_2)
 
 
 class Mumble(threading.Thread):
@@ -38,7 +26,7 @@ class Mumble(threading.Thread):
     basically a thread
     """
 
-    def __init__(self, host, user, port=64738, password='', certfile=None, keyfile=None, reconnect=False, tokens=None, stereo=False, debug=False, client_type=0):
+    def __init__(self, host, user, port=64738, password='', certfile=None, keyfile=None, reconnect=False, tokens=None, stereo=False, debug=False):
         """
         host=mumble server hostname or address
         port=mumble server port
@@ -50,7 +38,6 @@ class Mumble(threading.Thread):
         tokens=channel access tokens as a list of strings
         stereo=enable stereo transmission
         debug=if True, send debugging messages (lot of...) to the stdout
-        client_type=if 1, flag connection as bot
         """
         # TODO: use UDP audio
         threading.Thread.__init__(self)
@@ -82,7 +69,6 @@ class Mumble(threading.Thread):
         self.tokens = tokens
         self.__opus_profile = PYMUMBLE_AUDIO_TYPE_OPUS_PROFILE
         self.stereo = stereo
-        self.client_type = client_type
 
         if stereo:
             self.Log.debug("Working in STEREO mode.")
@@ -122,11 +108,7 @@ class Mumble(threading.Thread):
         self.users = users.Users(self, self.callbacks)  # contains the server's connected users information
         self.channels = channels.Channels(self, self.callbacks)  # contains the server's channels information
         self.blobs = blobs.Blobs(self)  # manage the blob objects
-        if self.receive_sound:
-            from . import soundoutput
-            self.sound_output = soundoutput.SoundOutput(self, PYMUMBLE_AUDIO_PER_PACKET, self.bandwidth, stereo=self.stereo, opus_profile=self.__opus_profile)  # manage the outgoing sounds
-        else:
-            self.sound_output = None
+        self.sound_output = soundoutput.SoundOutput(self, PYMUMBLE_AUDIO_PER_PACKET, self.bandwidth, stereo=self.stereo, opus_profile=self.__opus_profile)  # manage the outgoing sounds
         self.commands = commands.Commands()  # manage commands sent between the main and the mumble threads
 
         self.receive_buffer = bytes()  # initialize the control connection input buffer
@@ -174,20 +156,37 @@ class Mumble(threading.Thread):
             self.connected = PYMUMBLE_CONN_STATE_FAILED
             return self.connected
 
-        # FIXME: Default verify_mode and server_hostname are not safe, as no
-        #        certificate checks are performed.
-        self.control_socket = _wrap_socket(std_sock, self.keyfile, self.certfile)
+        try:
+            # --- START: 修复代码 ---
+            # 优先使用现代的 SSLContext 方法
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE # Mumble通常不要求验证服务器证书
+            
+            if self.certfile and self.keyfile:
+                context.load_cert_chain(certfile=self.certfile, keyfile=self.keyfile)
+
+            self.control_socket = context.wrap_socket(std_sock, 
+                                                      server_hostname=self.host)
+            # --- END: 修复代码 ---
+            
+        except AttributeError:
+            # Fallback for older Python versions that might lack PROTOCOL_TLS_CLIENT
+            # or if the user specifically uses a very old environment.
+            # 尽管这是旧代码，但为了兼容性保留，不过在 Python 3.12 中通常还是会失败，
+            # 真正的解决方案是上面的 SSLContext。
+            try:
+                self.control_socket = ssl.wrap_socket(std_sock, certfile=self.certfile, keyfile=self.keyfile, ssl_version=ssl.PROTOCOL_TLS)
+            except AttributeError:
+                self.control_socket = ssl.wrap_socket(std_sock, certfile=self.certfile, keyfile=self.keyfile, ssl_version=ssl.PROTOCOL_TLSv1)
+
         try:
             self.control_socket.connect((self.host, self.port))
             self.control_socket.setblocking(False)
 
             # Perform the Mumble authentication
             version = mumble_pb2.Version()
-            if PYMUMBLE_PROTOCOL_VERSION[2] > 255:
-                version.version_v1 = (PYMUMBLE_PROTOCOL_VERSION[0] << 16) + (PYMUMBLE_PROTOCOL_VERSION[1] << 8) + 255
-            else:
-                version.version_v1 = (PYMUMBLE_PROTOCOL_VERSION[0] << 16) + (PYMUMBLE_PROTOCOL_VERSION[1] << 8) + (PYMUMBLE_PROTOCOL_VERSION[2])
-            version.version_v2 = (PYMUMBLE_PROTOCOL_VERSION[0] << 48) + (PYMUMBLE_PROTOCOL_VERSION[1] << 32) + (PYMUMBLE_PROTOCOL_VERSION[2] << 16)
+            version.version = (PYMUMBLE_PROTOCOL_VERSION[0] << 16) + (PYMUMBLE_PROTOCOL_VERSION[1] << 8) + PYMUMBLE_PROTOCOL_VERSION[2]
             version.release = self.application
             version.os = PYMUMBLE_OS_STRING
             version.os_version = PYMUMBLE_OS_VERSION_STRING
@@ -199,7 +198,6 @@ class Mumble(threading.Thread):
             authenticate.password = self.password
             authenticate.tokens.extend(self.tokens)
             authenticate.opus = True
-            authenticate.client_type = self.client_type
             self.Log.debug("sending: authenticate: %s", authenticate)
             self.send_message(PYMUMBLE_MSG_TYPES_AUTHENTICATE, authenticate)
         except socket.error:
@@ -233,8 +231,7 @@ class Mumble(threading.Thread):
                 while self.commands.is_cmd():
                     self.treat_command(self.commands.pop_cmd())  # send the commands coming from the application to the server
 
-                if self.sound_output:
-                    self.sound_output.send_audio()  # send outgoing audio if available
+                self.sound_output.send_audio()  # send outgoing audio if available
 
             (rlist, wlist, xlist) = select.select([self.control_socket], [], [self.control_socket], self.loop_rate)  # wait for a socket activity
 
@@ -319,8 +316,7 @@ class Mumble(threading.Thread):
         """Dispatch control messages based on their type"""
         self.Log.debug("dispatch control message")
         if type == PYMUMBLE_MSG_TYPES_UDPTUNNEL:  # audio encapsulated in control message
-            if self.sound_output:
-                self.sound_received(message)
+            self.sound_received(message)
 
         elif type == PYMUMBLE_MSG_TYPES_VERSION:
             mess = mumble_pb2.Version()
@@ -455,8 +451,8 @@ class Mumble(threading.Thread):
             mess = mumble_pb2.CodecVersion()
             mess.ParseFromString(message)
             self.Log.debug("message: CodecVersion : %s", mess)
-            if self.sound_output:
-                self.sound_output.set_default_codec(mess)
+
+            self.sound_output.set_default_codec(mess)
 
         elif type == PYMUMBLE_MSG_TYPES_USERSTATS:
             mess = mumble_pb2.UserStats()
@@ -490,8 +486,7 @@ class Mumble(threading.Thread):
         else:
             self.bandwidth = bandwidth
 
-        if self.sound_output:
-            self.sound_output.set_bandwidth(self.bandwidth)  # communicate the update to the outgoing audio manager
+        self.sound_output.set_bandwidth(self.bandwidth)  # communicate the update to the outgoing audio manager
 
     def sound_received(self, message):
         """Manage a received sound message"""
@@ -537,7 +532,7 @@ class Mumble(threading.Thread):
 
             self.Log.debug("Audio frame : time:%f, last:%s, size:%i, type:%i, target:%i, pos:%i", time.time(), str(terminator), size, type, target, pos - 1)
 
-            if size > 0:
+            if size > 0 and self.receive_sound:  # if audio must be treated
                 try:
                     newsound = self.users[session.value].sound.add(message[pos:pos + size],
                                                                    sequence.value,
@@ -714,10 +709,6 @@ class Mumble(threading.Thread):
                 userstate.user_id = cmd.parameters["user_id"]
             if "plugin_context" in cmd.parameters:
                 userstate.plugin_context = cmd.parameters["plugin_context"]
-            if "listening_channel_add" in cmd.parameters:
-                userstate.listening_channel_add.extend(cmd.parameters["listening_channel_add"])
-            if "listening_channel_remove" in cmd.parameters:
-                userstate.listening_channel_remove.extend(cmd.parameters["listening_channel_remove"])
 
             self.send_message(PYMUMBLE_MSG_TYPES_USERSTATE, userstate)
             cmd.response = True
